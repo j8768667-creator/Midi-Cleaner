@@ -864,116 +864,121 @@
 
             static extractNotes(trackData, ticksPerBeat, defaultMpqn) {
                 const notes = [];
-                let currentTime = 0;
-                const activeNotes = new Map();
                 let firstTempoMpqn = null;
 
-                for (const track of trackData) {
+                const readVLQ = (data, pos) => {
+                    let value = 0;
+                    let count = 0;
+                    while (pos < data.length) {
+                        const b = data[pos++];
+                        value = (value << 7) | (b & 0x7F);
+                        count++;
+                        if ((b & 0x80) === 0) break;
+                        if (count > 4) throw new Error('Invalid MIDI variable-length value');
+                    }
+                    return { value, pos };
+                };
+
+                for (let trackIndex = 0; trackIndex < trackData.length; trackIndex++) {
+                    const data = trackData[trackIndex].data;
                     let pos = 0;
-                    currentTime = 0;
-                    const data = track.data;
+                    let currentTime = 0;
+                    let runningStatus = null;
+                    const activeNotes = new Map();
+
+                    const keyFor = (channel, note) => `${channel}:${note}`;
 
                     while (pos < data.length) {
-                        // Read delta time (variable length)
-                        let delta = 0;
-                        let shift = 0;
-                        let byte;
-                        do {
-                            byte = data[pos++];
-                            delta |= (byte & 0x7F) << shift;
-                            shift += 7;
-                        } while (byte & 0x80);
+                        const deltaInfo = readVLQ(data, pos);
+                        currentTime += deltaInfo.value;
+                        pos = deltaInfo.pos;
+                        if (pos >= data.length) break;
 
-                        currentTime += delta;
-
-                        // Read status byte
-                        let status = data[pos++];
-                        let channel = status & 0x0F;
-                        let type = status >> 4;
-
-                        // Running status
-                        if (type === 0xF) {
-                            // Meta or SysEx
-                            if (status === 0xFF) {
-                                const metaType = data[pos++];
-                                // Meta event length is a variable-length quantity,
-                                // not a single byte - a fixed-byte read desyncs
-                                // parsing on any meta event with length >= 128.
-                                let metaLength = 0;
-                                let mByte;
-                                do {
-                                    mByte = data[pos++];
-                                    metaLength = (metaLength << 7) | (mByte & 0x7F);
-                                } while (mByte & 0x80);
-                                if (metaType === 0x51 && metaLength === 3 && firstTempoMpqn === null) {
-                                    firstTempoMpqn = (data[pos] << 16) | (data[pos+1] << 8) | data[pos+2];
-                                }
-                                pos += metaLength;
-                                continue;
+                        let status = data[pos];
+                        if (status < 0x80) {
+                            if (runningStatus === null) {
+                                throw new Error(`Running status used before status byte in track ${trackIndex}`);
                             }
-                            if (status === 0xF0 || status === 0xF7) {
-                                let len = 0;
-                                let b;
-                                do {
-                                    b = data[pos++];
-                                    len++;
-                                } while (b !== 0xF7);
-                                continue;
+                            status = runningStatus;
+                        } else {
+                            pos++;
+                            if (status < 0xF0) runningStatus = status;
+                        }
+
+                        if (status === 0xFF) {
+                            if (pos >= data.length) break;
+                            const metaType = data[pos++];
+                            const lengthInfo = readVLQ(data, pos);
+                            const metaLength = lengthInfo.value;
+                            pos = lengthInfo.pos;
+                            if (pos + metaLength > data.length) throw new Error('Truncated MIDI meta event');
+                            if (metaType === 0x51 && metaLength === 3 && firstTempoMpqn === null) {
+                                firstTempoMpqn = (data[pos] << 16) | (data[pos + 1] << 8) | data[pos + 2];
                             }
+                            pos += metaLength;
+                            if (metaType === 0x2F) break;
                             continue;
                         }
 
-                        if (type === 0x8 || type === 0x9) {
-                            // Note On/Off
-                            const note = data[pos++];
-                            const velocity = data[pos++];
+                        if (status === 0xF0 || status === 0xF7) {
+                            const lengthInfo = readVLQ(data, pos);
+                            pos = lengthInfo.pos + lengthInfo.value;
+                            if (pos > data.length) throw new Error('Truncated SysEx event');
+                            runningStatus = null;
+                            continue;
+                        }
 
-                            if (type === 0x9 && velocity > 0) {
-                                activeNotes.set(note, { start: currentTime, velocity, channel });
-                            } else {
-                                if (activeNotes.has(note)) {
-                                    const active = activeNotes.get(note);
-                                    const duration = currentTime - active.start;
-                                    notes.push({
-                                        note: note,
-                                        start: active.start,
-                                        end: currentTime,
-                                        duration: duration,
-                                        velocity: active.velocity,
-                                        channel: channel,
-                                    });
-                                    activeNotes.delete(note);
-                                } else {
-                                    // Note off without matching on - treat as artifact
-                                    // We'll handle this in cleaning
-                                }
+                        const type = status >> 4;
+                        const channel = status & 0x0F;
+                        const dataBytes = (type === 0xC || type === 0xD) ? 1 : 2;
+                        if (pos + dataBytes > data.length) throw new Error('Truncated MIDI channel event');
+                        const data1 = data[pos++];
+                        const data2 = dataBytes === 2 ? data[pos++] : 0;
+
+                        if (type === 0x9 && data2 > 0) {
+                            const key = keyFor(channel, data1);
+                            if (!activeNotes.has(key)) activeNotes.set(key, []);
+                            activeNotes.get(key).push({ start: currentTime, velocity: data2 });
+                        } else if (type === 0x8 || (type === 0x9 && data2 === 0)) {
+                            const key = keyFor(channel, data1);
+                            const stack = activeNotes.get(key);
+                            if (stack && stack.length) {
+                                const active = stack.shift();
+                                const end = Math.max(currentTime, active.start + 1);
+                                notes.push({
+                                    track: trackIndex,
+                                    note: data1,
+                                    start: active.start,
+                                    end,
+                                    duration: end - active.start,
+                                    velocity: active.velocity,
+                                    channel
+                                });
+                                if (stack.length === 0) activeNotes.delete(key);
                             }
-                        } else {
-                            // Other messages - skip
-                            if (type === 0xA || type === 0xB || type === 0xC || type === 0xD || type === 0xE) {
-                                // Skip extra bytes
-                                const param1 = data[pos++];
-                                const param2 = type === 0xC || type === 0xD ? 0 : data[pos++];
-                            }
+                        }
+                    }
+
+                    for (const [key, stack] of activeNotes.entries()) {
+                        const [channelText, noteText] = key.split(':');
+                        for (const active of stack) {
+                            const end = Math.max(currentTime, active.start + 1);
+                            notes.push({
+                                track: trackIndex,
+                                note: Number(noteText),
+                                start: active.start,
+                                end,
+                                duration: end - active.start,
+                                velocity: active.velocity,
+                                channel: Number(channelText),
+                                hanging: true
+                            });
                         }
                     }
                 }
 
-                // Handle hanging notes
-                for (const [note, active] of activeNotes) {
-                    notes.push({
-                        note: note,
-                        start: active.start,
-                        end: currentTime,
-                        duration: currentTime - active.start,
-                        velocity: active.velocity,
-                        channel: active.channel,
-                        hanging: true,
-                    });
-                }
-
                 notes.mpqn = firstTempoMpqn || defaultMpqn;
-                return notes.sort((a, b) => a.start - b.start || a.note - b.note);
+                return notes.sort((a, b) => a.start - b.start || a.track - b.track || a.channel - b.channel || a.note - b.note);
             }
         }
 
@@ -1813,6 +1818,8 @@
     });
 
     const bytes=[];
+    const mpqn = Math.max(1, Math.round(60000000 / (state.tempo || 120)));
+    bytes.push(0x00, 0xFF, 0x51, 0x03, (mpqn >> 16) & 0xFF, (mpqn >> 8) & 0xFF, mpqn & 0xFF);
     let lastTime=0;
 
     for(const e of events){
