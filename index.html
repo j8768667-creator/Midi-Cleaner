@@ -1788,79 +1788,51 @@
         }
 
         function buildMIDITrack(notes, ticksPerBeat) {
-            // Sort note-on/off events chronologically
-            const sorted = [...notes].sort((a, b) => a.start - b.start);
+    const events = [];
+    for (const n of notes) {
+        events.push({
+            time: Math.max(0, Math.round(n.start)),
+            type: 'on',
+            note: n.note,
+            velocity: Math.max(1, Math.min(127, n.velocity)),
+            channel: n.channel || 0
+        });
+        events.push({
+            time: Math.max(0, Math.round(n.end)),
+            type: 'off',
+            note: n.note,
+            velocity: 0,
+            channel: n.channel || 0
+        });
+    }
 
-            // Build track events
-            const events = [];
-            let currentTime = 0;
+    events.sort((a,b)=>{
+        if(a.time!==b.time) return a.time-b.time;
+        if(a.type!==b.type) return a.type==='off' ? -1 : 1;
+        return a.note-b.note;
+    });
 
-            for (const n of sorted) {
-                const deltaOn = n.start - currentTime;
-                events.push({ delta: deltaOn, type: 'note_on', note: n.note, velocity: n.velocity });
-                currentTime = n.start;
+    const bytes=[];
+    let lastTime=0;
 
-                const deltaOff = (n.end || n.start + 240) - currentTime;
-                events.push({ delta: deltaOff, type: 'note_off', note: n.note, velocity: 0 });
-                currentTime = n.end || n.start + 240;
-            }
+    for(const e of events){
+        let delta=e.time-lastTime;
+        if(delta<0) delta=0;
+        lastTime=e.time;
+        bytes.push(...writeVarLen(delta));
+        bytes.push((e.type==='on'?0x90:0x80)|(e.channel&0x0F));
+        bytes.push(e.note&0x7F);
+        bytes.push(e.velocity&0x7F);
+    }
 
-            // Build event data
-            const trackData = [];
+    bytes.push(0x00,0xFF,0x2F,0x00);
 
-            // Track header
-            const header = new Uint8Array(8);
-            header.set([0x4D, 0x54, 0x72, 0x6B], 0);
-            // Length placeholder
-            const lenPos = 4;
-
-            let eventBytes = [];
-
-            // End of track meta event
-            const endEvent = [0x00, 0xFF, 0x2F, 0x00];
-
-            // Calculate total size
-            let totalSize = 0;
-            const eventData = [];
-
-            for (const ev of events) {
-                const deltaBytes = writeVarLen(ev.delta);
-                const msg = [];
-
-                if (ev.type === 'note_on') {
-                    msg.push(0x90);
-                    msg.push(ev.note);
-                    msg.push(ev.velocity);
-                } else {
-                    msg.push(0x80);
-                    msg.push(ev.note);
-                    msg.push(0);
-                }
-
-                const bytes = [...deltaBytes, ...msg];
-                eventData.push(bytes);
-                totalSize += bytes.length;
-            }
-
-            // Add end event
-            eventData.push(endEvent);
-            totalSize += endEvent.length;
-
-            // Write header with length
-            const trackBytes = new Uint8Array(8 + totalSize);
-            trackBytes.set(header, 0);
-            const view = new DataView(trackBytes.buffer);
-            view.setUint32(lenPos, totalSize);
-
-            // Write events
-            let offset = 8;
-            for (const ev of eventData) {
-                trackBytes.set(ev, offset);
-                offset += ev.length;
-            }
-
-            return trackBytes;
-        }
+    const out=new Uint8Array(8+bytes.length);
+    out.set([0x4D,0x54,0x72,0x6B],0);
+    new DataView(out.buffer).setUint32(4,bytes.length);
+    out.set(bytes,8);
+    return out;
+}
 
         function writeVarLen(value) {
             let buffer = value & 0x7F;
