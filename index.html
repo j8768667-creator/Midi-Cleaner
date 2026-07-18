@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MIDI Restoration Studio v2.0</title>
+    <title>MIDI Restoration Studio v2.5</title>
     <style>
         /* ===== CSS VARIABLES & RESET ===== */
         :root {
@@ -645,9 +645,32 @@
                 </div>
                 <label class="cleanup-option" style="margin-top:8px">
                     <input type="checkbox" id="audioGuideEnabled" checked disabled>
-                    <span class="option-label">Use WAV-guided restoration</span>
-                    <span class="option-badge">safe</span>
+                    <span class="option-label">Use WAV harmonic guidance</span>
+                    <span class="option-badge">conservative</span>
                 </label>
+                <label class="cleanup-option">
+                    <input type="checkbox" id="harmonicFilterEnabled" checked disabled>
+                    <span class="option-label">Remove unsupported artefact notes</span>
+                    <span class="option-badge">pitch evidence</span>
+                </label>
+                <label class="cleanup-option">
+                    <input type="checkbox" id="audioTimingEnabled" disabled>
+                    <span class="option-label">Align timing to WAV attacks</span>
+                    <span class="option-badge">optional</span>
+                </label>
+                <label class="cleanup-option">
+                    <input type="checkbox" id="audioVelocityEnabled" disabled>
+                    <span class="option-label">Match WAV dynamics</span>
+                    <span class="option-badge">optional</span>
+                </label>
+                <div style="margin-top:8px;font-size:12px;color:var(--text-secondary)">
+                    Harmonic strength
+                    <input id="harmonicStrength" type="range" min="0" max="100" value="35"
+                           style="width:100%;accent-color:var(--accent-blue)">
+                    <div style="display:flex;justify-content:space-between;color:var(--text-muted)">
+                        <span>Safer</span><span id="harmonicStrengthValue">35%</span><span>Stronger</span>
+                    </div>
+                </div>
             </div>
 
             <!-- Instrument Profile -->
@@ -747,17 +770,17 @@
                         <span class="option-badge">merge</span>
                     </label>
                     <label class="cleanup-option">
-                        <input type="checkbox" checked data-module="timing">
+                        <input type="checkbox" data-module="timing">
                         <span class="option-label">Timing Repair</span>
                         <span class="option-badge">quantise</span>
                     </label>
                     <label class="cleanup-option">
-                        <input type="checkbox" checked data-module="velocity">
+                        <input type="checkbox" data-module="velocity">
                         <span class="option-label">Velocity Smoothing</span>
                         <span class="option-badge">smooth</span>
                     </label>
                     <label class="cleanup-option">
-                        <input type="checkbox" checked data-module="pitch">
+                        <input type="checkbox" data-module="pitch">
                         <span class="option-label">Pitch Stability</span>
                         <span class="option-badge">stabilise</span>
                     </label>
@@ -767,7 +790,7 @@
                         <span class="option-badge">trim</span>
                     </label>
                     <label class="cleanup-option">
-                        <input type="checkbox" checked data-module="gap">
+                        <input type="checkbox" data-module="gap">
                         <span class="option-label">Gap Filling</span>
                         <span class="option-badge">fill</span>
                     </label>
@@ -1503,12 +1526,21 @@
                 $('audioDuration').textContent = `${decoded.duration.toFixed(2)} s`;
                 $('audioOnsets').textContent = `${state.audioAnalysis.onsets.length} attacks`;
                 $('audioGuideEnabled').disabled = false;
+                $('harmonicFilterEnabled').disabled = false;
+                $('audioTimingEnabled').disabled = false;
+                $('audioVelocityEnabled').disabled = false;
                 $('audioGuideEnabled').checked = true;
+                $('harmonicFilterEnabled').checked = true;
+                $('audioTimingEnabled').checked = false;
+                $('audioVelocityEnabled').checked = false;
                 setStatus(`Audio reference ready — ${state.audioAnalysis.onsets.length} attacks detected`, 'highlight');
             } catch (err) {
                 state.audioBuffer = null;
                 state.audioAnalysis = null;
                 $('audioGuideEnabled').disabled = true;
+                $('harmonicFilterEnabled').disabled = true;
+                $('audioTimingEnabled').disabled = true;
+                $('audioVelocityEnabled').disabled = true;
                 showModal('Audio Error', `Could not analyse the audio reference: ${err.message}`);
             }
         }
@@ -1549,7 +1581,7 @@
                     onsets.push(i*hop/sr); last=i;
                 }
             }
-            return {sampleRate:sr, duration:buffer.duration, hop, envelope:smooth, onsets};
+            return {sampleRate:sr, duration:buffer.duration, hop, envelope:smooth, onsets, mono};
         }
 
         function envelopeAt(seconds) {
@@ -1559,38 +1591,138 @@
             return a.envelope[idx] || 0;
         }
 
+        function goertzelMagnitude(samples, sampleRate, frequency, centreSeconds, windowSeconds=0.09) {
+            if (!samples || frequency < 20 || frequency > sampleRate * 0.45) return 0;
+            const half = Math.max(64, Math.round(windowSeconds * sampleRate / 2));
+            const centre = Math.round(centreSeconds * sampleRate);
+            const start = Math.max(0, centre - half);
+            const end = Math.min(samples.length, centre + half);
+            const count = end - start;
+            if (count < 128) return 0;
+
+            const omega = 2 * Math.PI * frequency / sampleRate;
+            const coeff = 2 * Math.cos(omega);
+            let s0 = 0, s1 = 0, s2 = 0;
+            for (let i = start; i < end; i++) {
+                const pos = (i - start) / Math.max(1, count - 1);
+                const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * pos);
+                s0 = samples[i] * window + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            const power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+            return Math.sqrt(Math.max(0, power)) / count;
+        }
+
+        function midiFrequency(note) {
+            return 440 * Math.pow(2, (note - 69) / 12);
+        }
+
+        function pitchSupport(note, seconds) {
+            const a = state.audioAnalysis;
+            if (!a || !a.mono) return 1;
+            const f = midiFrequency(note);
+            const fundamental = goertzelMagnitude(a.mono, a.sampleRate, f, seconds);
+            const harmonic2 = goertzelMagnitude(a.mono, a.sampleRate, f * 2, seconds) * 0.35;
+            const lower = goertzelMagnitude(a.mono, a.sampleRate, f / 2, seconds) * 0.16;
+            const left = goertzelMagnitude(a.mono, a.sampleRate, f / Math.pow(2, 1/12), seconds);
+            const right = goertzelMagnitude(a.mono, a.sampleRate, f * Math.pow(2, 1/12), seconds);
+            const localFloor = Math.max(1e-9, (left + right) * 0.5);
+            return (fundamental + harmonic2 + lower) / localFloor;
+        }
+
         function applyAudioGuidance(notes) {
-            const a=state.audioAnalysis;
-            if(!a || !$('audioGuideEnabled') || !$('audioGuideEnabled').checked) return notes.map(n=>({...n}));
-            const tpb=state.ticksPerBeat||480;
-            const bpm=state.tempo||120;
-            const secPerTick=60/(bpm*tpb);
-            const tickPerSec=1/secPerTick;
-            const tolerance=0.085;
-            const guided=notes.map(n=>{
-                const startSec=n.start*secPerTick;
-                let nearest=null, best=tolerance+1;
-                for(const onset of a.onsets){
-                    const d=Math.abs(onset-startSec);
-                    if(d<best){best=d; nearest=onset;}
-                    if(onset>startSec+tolerance) break;
+            const a = state.audioAnalysis;
+            if (!a || !$('audioGuideEnabled') || !$('audioGuideEnabled').checked) {
+                return notes.map(n => ({...n}));
+            }
+
+            const tpb = state.ticksPerBeat || 480;
+            const bpm = state.tempo || 120;
+            const secPerTick = 60 / (bpm * tpb);
+            const tickPerSec = 1 / secPerTick;
+            const strength = Number($('harmonicStrength')?.value || 35) / 100;
+            const useFilter = $('harmonicFilterEnabled')?.checked;
+            const useTiming = $('audioTimingEnabled')?.checked;
+            const useVelocity = $('audioVelocityEnabled')?.checked;
+            const tolerance = 0.055;
+
+            // Determine local note density so chord tones are protected.
+            const onsetWindowTicks = Math.max(1, Math.round(0.055 * tickPerSec));
+            const chordSizes = notes.map((n, index) => {
+                let count = 0;
+                for (let j = 0; j < notes.length; j++) {
+                    if (Math.abs(notes[j].start - n.start) <= onsetWindowTicks) count++;
                 }
-                let shiftTicks=0;
-                if(nearest!==null && best<=tolerance) shiftTicks=Math.round((nearest-startSec)*tickPerSec*0.75);
-                const attackEnv=envelopeAt(nearest!==null && best<=tolerance ? nearest : startSec);
-                const targetVel=Math.round(24+attackEnv*96);
-                const velocity=Math.max(1,Math.min(127,Math.round(n.velocity*0.55+targetVel*0.45)));
-                let end=n.end+shiftTicks;
-                const shiftedStart=Math.max(0,n.start+shiftTicks);
-                if(end<=shiftedStart) end=shiftedStart+Math.max(1,Math.round(0.03*tickPerSec));
-                // Conservative sustain extension: only bridge a very short tail while energy remains strong.
-                const endSec=end*secPerTick;
-                const tail=envelopeAt(endSec);
-                const later=envelopeAt(endSec+0.06);
-                if(tail>0.18 && later>tail*0.55) end+=Math.round(0.04*tickPerSec);
-                return {...n,start:shiftedStart,end,duration:end-shiftedStart,velocity,audioAligned:shiftTicks!==0};
+                return count;
             });
-            return guided.sort((x,y)=>x.start-y.start||x.note-y.note);
+
+            const guided = [];
+            let removedByAudio = 0;
+            let alignedByAudio = 0;
+
+            notes.forEach((n, index) => {
+                const startSec = n.start * secPerTick;
+                const durationSec = Math.max(0, (n.end - n.start) * secPerTick);
+                const sampleSec = Math.min(a.duration, startSec + Math.min(0.045, durationSec * 0.35));
+                const support = pitchSupport(n.note, sampleSec);
+
+                // Only reject notes when several warning signs agree.
+                // Strong chord notes, long notes and high-velocity notes are deliberately protected.
+                const shortNote = durationSec < (0.075 + strength * 0.06);
+                const lowVelocity = n.velocity < (34 + strength * 22);
+                const isolated = chordSizes[index] <= 2;
+                const weakSupport = support < (0.72 + strength * 0.55);
+                const extremelyWeak = support < (0.42 + strength * 0.30);
+                const suspicious = (shortNote && lowVelocity && weakSupport) ||
+                                   (isolated && lowVelocity && extremelyWeak);
+
+                if (useFilter && suspicious) {
+                    removedByAudio++;
+                    return;
+                }
+
+                let start = n.start;
+                let end = n.end;
+                let velocity = n.velocity;
+
+                if (useTiming) {
+                    let nearest = null, best = tolerance + 1;
+                    for (const onset of a.onsets) {
+                        const d = Math.abs(onset - startSec);
+                        if (d < best) { best = d; nearest = onset; }
+                        if (onset > startSec + tolerance) break;
+                    }
+                    if (nearest !== null && best <= tolerance) {
+                        const maxShift = Math.round(0.018 * tickPerSec);
+                        const rawShift = Math.round((nearest - startSec) * tickPerSec * (0.15 + strength * 0.25));
+                        const shift = Math.max(-maxShift, Math.min(maxShift, rawShift));
+                        start = Math.max(0, n.start + shift);
+                        end = Math.max(start + 1, n.end + shift);
+                        if (shift !== 0) alignedByAudio++;
+                    }
+                }
+
+                if (useVelocity) {
+                    const attackEnv = envelopeAt(start * secPerTick);
+                    const target = Math.round(35 + attackEnv * 75);
+                    const blend = 0.08 + strength * 0.17;
+                    velocity = Math.max(1, Math.min(127, Math.round(n.velocity * (1 - blend) + target * blend)));
+                }
+
+                guided.push({
+                    ...n,
+                    start,
+                    end,
+                    duration: end - start,
+                    velocity,
+                    audioSupport: support,
+                    audioAligned: start !== n.start
+                });
+            });
+
+            state.audioGuideStats = {removedByAudio, alignedByAudio};
+            return guided.sort((x, y) => x.start - y.start || x.note - y.note);
         }
 
         // ---- Analysis ----
@@ -1724,7 +1856,9 @@
                 merged ${stats.merged} fragments,
                 corrected ${stats.corrected} pitches.
                 ${cleaned.length} notes remaining.
-                ${state.audioAnalysis && $('audioGuideEnabled').checked ? cleaned.filter(n => n.audioAligned).length + ' notes aligned to WAV attacks.' : ''}
+                ${state.audioAnalysis && $('audioGuideEnabled').checked
+                    ? `${state.audioGuideStats?.removedByAudio || 0} unsupported notes removed by WAV evidence; ${state.audioGuideStats?.alignedByAudio || 0} notes gently aligned.`
+                    : ''}
             `;
             setStatus(`✅ Clean complete — ${summary}`, 'highlight');
 
@@ -2051,7 +2185,7 @@
 
         function exportSession() {
             const session = {
-                version: '2.0',
+                version: '2.5',
                 timestamp: new Date().toISOString(),
                 noteCount: state.notes.length,
                 cleaned: state.isCleaned,
@@ -2163,10 +2297,10 @@
                 const presets = {
                     light: { duplicate: true, ghost: true, fragment: true, timing: false, velocity: false, pitch: false,
                         overlap: true, gap: false },
-                    standard: { duplicate: true, ghost: true, fragment: true, timing: true, velocity: true, pitch: true,
-                        overlap: true, gap: true },
+                    standard: { duplicate: true, ghost: true, fragment: true, timing: false, velocity: false, pitch: false,
+                        overlap: true, gap: false },
                     aggressive: { duplicate: true, ghost: true, fragment: true, timing: true, velocity: true, pitch: true,
-                        overlap: true, gap: true },
+                        overlap: true, gap: false },
                     jazz: { duplicate: true, ghost: true, fragment: true, timing: false, velocity: true, pitch: false,
                         overlap: true, gap: true },
                     classical: { duplicate: true, ghost: true, fragment: true, timing: false, velocity: false, pitch: false,
@@ -2228,6 +2362,12 @@
         function init() {
             initFileHandling();
             initAudioHandling();
+            const strength = $('harmonicStrength');
+            if (strength) {
+                const updateStrength = () => $('harmonicStrengthValue').textContent = `${strength.value}%`;
+                strength.addEventListener('input', updateStrength);
+                updateStrength();
+            }
             resizeCanvas();
 
             // Set default preset
