@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MIDI Restoration Studio v4.0</title>
+    <title>MIDI Restoration Studio v4.1 Fixed</title>
     <style>
         /* ===== CSS VARIABLES & RESET ===== */
         :root {
@@ -500,7 +500,7 @@
         <!-- ===== HEADER ===== -->
         <header class="header">
             <div class="header-left">
-                <div class="logo">🎵 MIDI Restoration <span>Studio <span class="version">v4.0</span></span></div>
+                <div class="logo">🎵 MIDI Restoration <span>Studio <span class="version">v4.1 Fixed</span></span></div>
                 <span class="validation-badge" id="validationBadge">✓ Validated</span>
             </div>
             <div class="header-actions">
@@ -682,7 +682,7 @@
     <!-- ============================================================ -->
     <script>
         // ============================================================
-        // MIDI Restoration Studio v4.0 - Complete Implementation
+        // MIDI Restoration Studio v4.1 Fixed - Reliable Restoration Build
         // Core Design: Restoration, not composition
         // ============================================================
 
@@ -700,6 +700,7 @@
             ppq: 480,
             format: 1,
             duration: 0,
+            originalMaxTime: 0,
             
             // Audio data
             audioData: null,
@@ -830,14 +831,13 @@
                 let maxTime = 0;
 
                 while (pos < data.length) {
+                    // Standard MIDI VLQ is big-endian in 7-bit groups.
                     let delta = 0;
-                    let shift = 0;
                     let byte;
                     do {
-                        if (pos >= data.length) break;
+                        if (pos >= data.length) throw new Error('Unexpected end of track while reading delta time');
                         byte = data[pos++];
-                        delta |= (byte & 0x7F) << shift;
-                        shift += 7;
+                        delta = (delta << 7) | (byte & 0x7F);
                     } while (byte & 0x80);
                     currentTime += delta;
                     if (currentTime > maxTime) maxTime = currentTime;
@@ -861,7 +861,13 @@
                         if (pos >= data.length) break;
                         const metaType = data[pos++];
                         if (pos >= data.length) break;
-                        const length = data[pos++];
+                        let length = 0;
+                        let lengthByte;
+                        do {
+                            if (pos >= data.length) throw new Error('Unexpected end of track while reading meta-event length');
+                            lengthByte = data[pos++];
+                            length = (length << 7) | (lengthByte & 0x7F);
+                        } while (lengthByte & 0x80);
                         const metaData = data.slice(pos, pos + length);
                         pos += length;
                         
@@ -957,45 +963,54 @@
         // ============================================================
 
         class MIDIWriter {
-            static write(notes, ppq, tempoMap, timeSignatures, keySignatures, format = 1) {
-                // Build event timeline - preserve original order
-                const events = this.buildEventTimeline(notes, ppq);
-                
-                const header = this.writeHeader(format, 1, ppq);
-                const trackData = this.writeTrack(events, ppq, tempoMap, timeSignatures, keySignatures);
-                
+            static write(notes, ppq, tempoMap, timeSignatures, keySignatures, format = 0, endTick = null) {
+                const events = this.buildEventTimeline(notes, tempoMap, timeSignatures, keySignatures);
+                const finalTick = endTick == null
+                    ? Math.max(0, ...notes.map(n => Math.round(n.end ?? (n.start + 1))))
+                    : Math.max(0, Math.round(endTick));
+
+                const header = this.writeHeader(0, 1, ppq);
+                const trackData = this.writeTrack(events, finalTick);
                 const result = new Uint8Array(header.length + trackData.length);
                 result.set(header, 0);
                 result.set(trackData, header.length);
                 return result;
             }
 
-            static buildEventTimeline(notes, ppq) {
+            static buildEventTimeline(notes, tempoMap, timeSignatures, keySignatures) {
                 const events = [];
+
+                for (const t of (tempoMap || [])) {
+                    events.push({ time: Math.max(0, Math.round(t.time || 0)), type: 'tempo', tempo: t.tempo || 500000 });
+                }
+                for (const ts of (timeSignatures || [])) {
+                    events.push({ time: Math.max(0, Math.round(ts.time || 0)), type: 'time_signature', ...ts });
+                }
+                for (const ks of (keySignatures || [])) {
+                    events.push({ time: Math.max(0, Math.round(ks.time || 0)), type: 'key_signature', ...ks });
+                }
                 for (const n of notes) {
-                    // Ensure note-on and note-off are properly ordered
+                    const start = Math.max(0, Math.round(n.start));
+                    const end = Math.max(start + 1, Math.round(n.end ?? (n.start + Math.max(1, n.duration || 1))));
                     events.push({
-                        time: Math.max(0, Math.round(n.start)),
-                        type: 'note_on',
-                        note: n.note,
-                        velocity: Math.min(127, Math.max(0, n.velocity || 64)),
-                        channel: n.channel || 0,
-                        track: n.track || 0,
+                        time: start, type: 'note_on', note: n.note,
+                        velocity: Math.min(127, Math.max(1, n.velocity || 64)),
+                        channel: n.channel || 0, id: n.id ?? 0
                     });
                     events.push({
-                        time: Math.max(0, Math.round(n.end || n.start + 240)),
-                        type: 'note_off',
-                        note: n.note,
-                        velocity: 0,
-                        channel: n.channel || 0,
-                        track: n.track || 0,
+                        time: end, type: 'note_off', note: n.note, velocity: 0,
+                        channel: n.channel || 0, id: n.id ?? 0
                     });
                 }
-                // Sort by time, note_on before note_off at same time
-                return events.sort((a, b) => {
-                    if (a.time !== b.time) return a.time - b.time;
-                    return a.type === 'note_on' ? -1 : 1;
-                });
+
+                const priority = { tempo: 0, time_signature: 1, key_signature: 2, note_off: 3, note_on: 4 };
+                return events.sort((a, b) =>
+                    a.time - b.time ||
+                    (priority[a.type] ?? 9) - (priority[b.type] ?? 9) ||
+                    (a.channel || 0) - (b.channel || 0) ||
+                    (a.note || 0) - (b.note || 0) ||
+                    (a.id || 0) - (b.id || 0)
+                );
             }
 
             static writeHeader(format, numTracks, ppq) {
@@ -1009,101 +1024,44 @@
                 return data;
             }
 
-            static writeTrack(events, ppq, tempoMap, timeSignatures, keySignatures) {
-                const trackData = [];
+            static writeTrack(events, endTick) {
+                const bytes = [];
                 let currentTime = 0;
-                
-                // Write tempo events at their correct times
-                const sortedTempo = [...tempoMap].sort((a, b) => a.time - b.time);
-                for (const t of sortedTempo) {
-                    const delta = t.time - currentTime;
-                    if (delta >= 0) {
-                        trackData.push(...this.writeVarLen(Math.floor(delta)));
-                        trackData.push(0xFF, 0x51, 0x03);
-                        const tempo = t.tempo || 500000;
-                        trackData.push((tempo >> 16) & 0xFF);
-                        trackData.push((tempo >> 8) & 0xFF);
-                        trackData.push(tempo & 0xFF);
-                        currentTime = t.time;
-                    }
-                }
 
-                // Write time signatures
-                for (const ts of timeSignatures) {
-                    const delta = ts.time - currentTime;
-                    if (delta >= 0) {
-                        trackData.push(...this.writeVarLen(Math.floor(delta)));
-                        trackData.push(0xFF, 0x58, 0x04);
-                        trackData.push(ts.numerator || 4);
-                        trackData.push(Math.log2(ts.denominator || 4));
-                        trackData.push(24);
-                        trackData.push(8);
-                        currentTime = ts.time;
-                    }
-                }
+                for (const ev of events) {
+                    const eventTime = Math.max(currentTime, Math.round(ev.time));
+                    bytes.push(...this.writeVarLen(eventTime - currentTime));
 
-                // Write key signatures
-                for (const ks of keySignatures) {
-                    const delta = ks.time - currentTime;
-                    if (delta >= 0) {
-                        trackData.push(...this.writeVarLen(Math.floor(delta)));
-                        trackData.push(0xFF, 0x59, 0x02);
-                        trackData.push(ks.key || 0);
-                        trackData.push(ks.scale || 0);
-                        currentTime = ks.time;
-                    }
-                }
-
-                // Write all note events in chronological order
-                const sortedEvents = [...events].sort((a, b) => {
-                    if (a.time !== b.time) return a.time - b.time;
-                    return a.type === 'note_on' ? -1 : 1;
-                });
-                
-                for (const ev of sortedEvents) {
-                    const delta = ev.time - currentTime;
-                    if (delta < 0) continue;
-                    
-                    trackData.push(...this.writeVarLen(Math.floor(delta)));
-                    
-                    if (ev.type === 'note_on') {
-                        trackData.push(0x90 | (ev.channel & 0x0F));
-                        trackData.push(ev.note & 0x7F);
-                        trackData.push(Math.min(127, Math.max(0, ev.velocity)));
+                    if (ev.type === 'tempo') {
+                        const tempo = ev.tempo || 500000;
+                        bytes.push(0xFF, 0x51, 0x03, (tempo >> 16) & 0xFF, (tempo >> 8) & 0xFF, tempo & 0xFF);
+                    } else if (ev.type === 'time_signature') {
+                        const denominator = Math.max(1, ev.denominator || 4);
+                        bytes.push(0xFF, 0x58, 0x04, ev.numerator || 4, Math.round(Math.log2(denominator)), 24, 8);
+                    } else if (ev.type === 'key_signature') {
+                        bytes.push(0xFF, 0x59, 0x02, (ev.key || 0) & 0xFF, (ev.scale || 0) & 0xFF);
+                    } else if (ev.type === 'note_on') {
+                        bytes.push(0x90 | (ev.channel & 0x0F), ev.note & 0x7F, ev.velocity & 0x7F);
                     } else if (ev.type === 'note_off') {
-                        trackData.push(0x80 | (ev.channel & 0x0F));
-                        trackData.push(ev.note & 0x7F);
-                        trackData.push(0);
+                        bytes.push(0x80 | (ev.channel & 0x0F), ev.note & 0x7F, 0);
                     }
-                    
-                    currentTime = ev.time;
+                    currentTime = eventTime;
                 }
 
-                // End of track
-                trackData.push(0x00, 0xFF, 0x2F, 0x00);
+                const finalTime = Math.max(currentTime, endTick || 0);
+                bytes.push(...this.writeVarLen(finalTime - currentTime), 0xFF, 0x2F, 0x00);
 
-                // Wrap in track chunk
-                const header = new Uint8Array([0x4D, 0x54, 0x72, 0x6B, 0x00, 0x00, 0x00, 0x00]);
-                const result = new Uint8Array(header.length + trackData.length);
-                result.set(header, 0);
-                result.set(trackData, header.length);
-                
-                const view = new DataView(result.buffer);
-                view.setUint32(4, trackData.length);
-                
+                const result = new Uint8Array(8 + bytes.length);
+                result.set([0x4D, 0x54, 0x72, 0x6B], 0);
+                new DataView(result.buffer).setUint32(4, bytes.length);
+                result.set(bytes, 8);
                 return result;
             }
 
             static writeVarLen(value) {
-                const bytes = [];
                 let v = Math.max(0, Math.floor(value));
-                while (true) {
-                    let b = v & 0x7F;
-                    v >>= 7;
-                    if (v > 0) b |= 0x80;
-                    bytes.push(b);
-                    if (v === 0) break;
-                }
+                const bytes = [v & 0x7F];
+                while ((v >>= 7) > 0) bytes.unshift((v & 0x7F) | 0x80);
                 return bytes;
             }
         }
@@ -1295,32 +1253,26 @@
             }
 
             repairOverlaps(notes) {
-                const sorted = [...notes].sort((a, b) => a.start - b.start);
+                const sorted = notes.map(n => ({ ...n })).sort((a, b) =>
+                    a.track - b.track || a.channel - b.channel || a.note - b.note || a.start - b.start
+                );
+                const lastByKey = new Map();
                 const result = [];
-                
+
                 for (const n of sorted) {
-                    let overlapping = false;
-                    for (const existing of result) {
-                        if (existing.note === n.note &&
-                            n.start < existing.end &&
-                            existing.start < n.end) {
-                            // Trim the overlapping note
-                            if (n.start >= existing.start) {
-                                n.start = existing.end + 10;
-                                if (n.start >= n.end) {
-                                    overlapping = true;
-                                    this.stats.removed++;
-                                    break;
-                                }
-                            }
-                        }
+                    const key = `${n.track || 0}|${n.channel || 0}|${n.note}`;
+                    const previous = lastByKey.get(key);
+                    if (previous && previous.end > n.start) {
+                        previous.end = Math.max(previous.start + 1, n.start);
+                        previous.duration = previous.end - previous.start;
+                        this.stats.repaired++;
                     }
-                    if (!overlapping) {
-                        result.push({ ...n });
-                    }
+                    n.end = Math.max(n.start + 1, n.end ?? (n.start + Math.max(1, n.duration || 1)));
+                    n.duration = n.end - n.start;
+                    result.push(n);
+                    lastByKey.set(key, n);
                 }
-                
-                return result;
+                return result.sort((a, b) => a.start - b.start || a.note - b.note);
             }
 
             removeGhosts(notes, instrument) {
@@ -1493,66 +1445,9 @@
             }
 
             repairChords(notes, confidenceMap) {
-                // Group by time windows
-                const windowSize = 240;
-                const grouped = new Map();
-                
-                for (const n of notes) {
-                    const window = Math.round(n.start / windowSize);
-                    if (!grouped.has(window)) grouped.set(window, []);
-                    grouped.get(window).push(n);
-                }
-                
-                const result = [];
-                for (const [window, group] of grouped) {
-                    if (group.length < 3) {
-                        result.push(...group);
-                        continue;
-                    }
-                    
-                    // Check for chord consistency
-                    const notesInGroup = group.map(n => n.note % 12);
-                    const root = notesInGroup[0];
-                    const hasThird = notesInGroup.some(n => n === (root + 4) % 12 || n === (root + 3) % 12);
-                    const hasFifth = notesInGroup.some(n => n === (root + 7) % 12);
-                    
-                    if (!hasThird || !hasFifth) {
-                        // Try to repair - only if high confidence
-                        if (confidenceMap) {
-                            const avgConf = group.reduce((sum, n) => sum + (confidenceMap.get(n.id || n) || 50), 0) / group
-                            .length;
-                            if (avgConf > 60) {
-                                // Add missing chord notes
-                                const notesToAdd = [];
-                                if (!hasThird) {
-                                    const third = root + (group[0].note < 60 ? 4 : 3);
-                                    notesToAdd.push({
-                                        ...group[0],
-                                        note: third,
-                                        velocity: Math.round(group[0].velocity * 0.7),
-                                        chordRepair: true,
-                                    });
-                                }
-                                if (!hasFifth) {
-                                    const fifth = root + 7;
-                                    notesToAdd.push({
-                                        ...group[0],
-                                        note: fifth,
-                                        velocity: Math.round(group[0].velocity * 0.6),
-                                        chordRepair: true,
-                                    });
-                                }
-                                result.push(...group, ...notesToAdd);
-                                this.stats.repaired += notesToAdd.length;
-                                continue;
-                            }
-                        }
-                    }
-                    
-                    result.push(...group);
-                }
-                
-                return result;
+                // Restoration must never add chord tones that were not present in the source.
+                // Keep this module diagnostic-only until a non-generative repair rule is available.
+                return notes.map(n => ({ ...n }));
             }
 
             applyAudioConfidence(notes, confidenceMap) {
@@ -1577,72 +1472,42 @@
         // ============================================================
 
         class ValidationEngine {
-            static validate(originalNotes, cleanedNotes, tempoMap, ppq) {
+            static validate(originalNotes, cleanedNotes, tempoMap, ppq, originalMaxTime = null) {
                 const errors = [];
                 const warnings = [];
+                const sourceEnd = originalMaxTime ?? (originalNotes.length
+                    ? Math.max(...originalNotes.map(n => n.end ?? (n.start + 1))) : 0);
+                const cleanedEnd = cleanedNotes.length
+                    ? Math.max(...cleanedNotes.map(n => n.end ?? (n.start + 1))) : 0;
 
-                // 1. Duration unchanged
-                const origDuration = originalNotes.length > 0 ? 
-                    Math.max(...originalNotes.map(n => n.end || n.start + 240)) : 0;
-                const cleanDuration = cleanedNotes.length > 0 ? 
-                    Math.max(...cleanedNotes.map(n => n.end || n.start + 240)) : 0;
-                
-                const durationDiff = Math.abs(origDuration - cleanDuration);
-                if (durationDiff > 10) {
-                    errors.push(`Duration changed: ${origDuration} → ${cleanDuration} ticks`);
+                // A restoration may shorten a damaged final note. It must not create material beyond the source.
+                if (cleanedEnd > sourceEnd + Math.max(10, Math.round(ppq * 0.05))) {
+                    errors.push(`Restoration extends beyond source: ${sourceEnd} → ${cleanedEnd} ticks`);
+                } else if (cleanedEnd !== sourceEnd) {
+                    warnings.push(`Last sounding note changed: ${sourceEnd} → ${cleanedEnd} ticks; export keeps the original end-of-track time`);
                 }
 
-                // 2. Tempo map unchanged - just check we preserved it
-                if (tempoMap && tempoMap.length > 0) {
-                    // We trust the writer preserves tempo
-                }
-
-                // 3. No hanging notes
                 const hanging = cleanedNotes.filter(n => n.hanging);
-                if (hanging.length > 0) {
-                    errors.push(`${hanging.length} hanging notes remain`);
-                }
+                if (hanging.length) errors.push(`${hanging.length} hanging notes remain`);
 
-                // 4. No duplicate note-ons
                 const seen = new Set();
                 let duplicates = 0;
                 for (const n of cleanedNotes) {
-                    const key = `${n.note}|${Math.round(n.start)}`;
+                    const key = `${n.track || 0}|${n.channel || 0}|${n.note}|${Math.round(n.start)}|${Math.round(n.end)}`;
                     if (seen.has(key)) duplicates++;
-                    seen.add(key);
+                    else seen.add(key);
                 }
-                if (duplicates > 0) {
-                    errors.push(`${duplicates} duplicate note-ons found`);
-                }
+                if (duplicates) errors.push(`${duplicates} exact duplicate notes found`);
 
-                // 5. No negative durations
-                const negative = cleanedNotes.filter(n => n.duration < 0);
-                if (negative.length > 0) {
-                    errors.push(`${negative.length} notes with negative duration`);
-                }
+                const invalidDuration = cleanedNotes.filter(n =>
+                    !Number.isFinite(n.start) || !Number.isFinite(n.end) || n.end <= n.start
+                );
+                if (invalidDuration.length) errors.push(`${invalidDuration.length} notes have invalid duration`);
 
-                // 6. Valid MIDI structure - check note range
-                const outOfRange = cleanedNotes.filter(n => n.note < 0 || n.note > 127);
-                if (outOfRange.length > 0) {
-                    errors.push(`${outOfRange.length} notes outside MIDI range`);
-                }
+                const outOfRange = cleanedNotes.filter(n => !Number.isInteger(n.note) || n.note < 0 || n.note > 127);
+                if (outOfRange.length) errors.push(`${outOfRange.length} notes outside MIDI range`);
 
-                // 7. No overlapping notes (warn only)
-                let overlaps = 0;
-                for (let i = 0; i < cleanedNotes.length; i++) {
-                    for (let j = i + 1; j < cleanedNotes.length; j++) {
-                        if (cleanedNotes[i].note === cleanedNotes[j].note &&
-                            cleanedNotes[i].start < cleanedNotes[j].end &&
-                            cleanedNotes[j].start < cleanedNotes[i].end) {
-                            overlaps++;
-                        }
-                    }
-                }
-                if (overlaps > 0) {
-                    warnings.push(`${overlaps} overlapping notes (may be intended)`);
-                }
-
-                return { passed: errors.length === 0, errors, warnings };
+                return { passed: errors.length === 0, errors, warnings, sourceEnd, cleanedEnd };
             }
         }
 
@@ -1700,7 +1565,9 @@
                     state.tempoMap = result.tempoMap;
                     state.timeSignatures = result.timeSignatures;
                     state.keySignatures = result.keySignatures;
+                    state.tracks = result.tracks;
                     state.duration = result.duration;
+                    state.originalMaxTime = result.maxTime;
                     
                     if (result.tempoMap.length > 0) {
                         state.detectedTempo = 60000000 / result.tempoMap[0].tempo;
@@ -1735,10 +1602,11 @@
                 return;
             }
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 try {
                     const arrayBuffer = e.target.result;
-                    decodeAudio(arrayBuffer);
+                    await decodeAudio(arrayBuffer);
+                    updateFileStatus();
                     setStatus(`✅ Audio loaded: ${file.name}`, 'success');
                 } catch (err) {
                     showModal('Error', `Failed to load audio: ${err.message}`);
@@ -2069,7 +1937,7 @@
             }
 
             // Run validation
-            const validation = ValidationEngine.validate(state.originalNotes, cleaned, state.tempoMap, state.ppq);
+            const validation = ValidationEngine.validate(state.originalNotes, cleaned, state.tempoMap, state.ppq, state.originalMaxTime);
             state.validationPassed = validation.passed;
             state.validationErrors = validation.errors;
 
@@ -2092,7 +1960,8 @@
                 `${summary}\n` +
                 `${cleaned.length} notes remaining\n` +
                 `Confidence: ${state.confidenceScore}%\n` +
-                `Validation: ${validation.passed ? '✅ PASSED' : '⚠️ ' + validation.errors.join(', ')}\n\n` +
+                `Validation: ${validation.passed ? '✅ PASSED' : '⚠️ ' + validation.errors.join(', ')}\n` +
+                `${validation.warnings.length ? 'Warnings: ' + validation.warnings.join(', ') + '\n' : ''}\n` +
                 `Export your cleaned MIDI using the Export button.`
             );
         }
@@ -2108,7 +1977,7 @@
                 state.cleanedNotes :
                 state.notes;
 
-            const validation = ValidationEngine.validate(state.originalNotes, notesToCheck, state.tempoMap, state.ppq);
+            const validation = ValidationEngine.validate(state.originalNotes, notesToCheck, state.tempoMap, state.ppq, state.originalMaxTime);
             state.validationPassed = validation.passed;
             state.validationErrors = validation.errors;
 
@@ -2156,7 +2025,7 @@
             }
 
             // Run validation before export
-            const validation = ValidationEngine.validate(state.originalNotes, state.cleanedNotes, state.tempoMap, state.ppq);
+            const validation = ValidationEngine.validate(state.originalNotes, state.cleanedNotes, state.tempoMap, state.ppq, state.originalMaxTime);
             if (!validation.passed) {
                 showModal('Validation Failed',
                     `Cannot export - validation failed:\n\n` +
@@ -2171,7 +2040,9 @@
                 const ppq = state.ppq || 480;
                 const tempoMap = state.tempoMap || [{ time: 0, tempo: 500000 }];
                 
-                const midiData = MIDIWriter.write(notes, ppq, tempoMap, state.timeSignatures || [], state.keySignatures || []);
+                const midiData = MIDIWriter.write(
+                    notes, ppq, tempoMap, state.timeSignatures || [], state.keySignatures || [], 0, state.originalMaxTime
+                );
                 const blob = new Blob([midiData], { type: 'audio/midi' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -2379,7 +2250,7 @@
         }
 
         function updateFileInfo(file) {
-            $('trackCount').textContent = state.format === 1 ? state.tracks.length : '1';
+            $('trackCount').textContent = state.tracks.length || 1;
             $('noteCount').textContent = state.notes.length;
             $('tempoDisplay').textContent = state.detectedTempo ? `${Math.round(state.detectedTempo)} BPM` : '—';
             $('formatDisplay').textContent = `Type ${state.format}`;
