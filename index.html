@@ -564,7 +564,9 @@
                     <button class="preset-btn" data-preset="piano">Piano</button>
                     <button class="preset-btn" data-preset="guitar">Guitar</button>
                     <button class="preset-btn" data-preset="bass">Bass</button>
+                    <button class="preset-btn" data-preset="composed" title="For MIDI that was sequenced/composed directly, not transcribed from audio. Fixes only technical errors (duplicates, overlaps, unterminated notes) and leaves timing, velocity, and pitch untouched.">Composed</button>
                 </div>
+                <div class="preset-hint" id="presetHint" style="font-size:11px; opacity:0.7; margin-top:6px; line-height:1.4; display:none;"></div>
             </div>
 
             <!-- Audio Status -->
@@ -637,6 +639,39 @@
                     <label class="module-option"><input type="checkbox" data-module="phrase"><span class="label">Phrase Continuity</span></label>
                     <label class="module-option"><input type="checkbox" data-module="chord"><span class="label">Chord Consistency</span></label>
                     <label class="module-option"><input type="checkbox" data-module="audio"><span class="label">🔊 Audio-Assisted</span></label>
+                </div>
+            </div>
+
+            <!-- Key Correction -->
+            <div class="panel-section">
+                <div class="panel-section-title">🎹 Key Correction</div>
+                <div style="display:flex; gap:6px; margin-bottom:6px;">
+                    <select id="keyRootSelect" style="flex:1; background:var(--bg-card); color:var(--text-primary); border:1px solid var(--border-color, #333); border-radius:4px; padding:4px;">
+                        <option value="">— Root —</option>
+                        <option value="0">C</option>
+                        <option value="1">C# / Db</option>
+                        <option value="2">D</option>
+                        <option value="3">D# / Eb</option>
+                        <option value="4">E</option>
+                        <option value="5">F</option>
+                        <option value="6">F# / Gb</option>
+                        <option value="7">G</option>
+                        <option value="8">G# / Ab</option>
+                        <option value="9">A</option>
+                        <option value="10">A# / Bb</option>
+                        <option value="11">B</option>
+                    </select>
+                    <select id="keyScaleSelect" style="flex:1; background:var(--bg-card); color:var(--text-primary); border:1px solid var(--border-color, #333); border-radius:4px; padding:4px;">
+                        <option value="major">Major</option>
+                        <option value="naturalMinor">Natural Minor</option>
+                        <option value="harmonicMinor">Harmonic Minor</option>
+                        <option value="melodicMinor">Melodic Minor</option>
+                    </select>
+                </div>
+                <button class="btn-icon" id="useDetectedKeyBtn" style="display:none; width:100%; margin-bottom:6px; font-size:11px;" onclick="useDetectedKey()">Use detected key</button>
+                <label class="module-option"><input type="checkbox" data-module="key" id="keyModuleCheckbox"><span class="label">Snap notes to key</span></label>
+                <div style="font-size:11px; opacity:0.7; margin-top:4px; line-height:1.4;">
+                    ⚠️ Unlike the modules above, this changes note pitches. Any note outside the selected scale is moved to the nearest scale tone. Off by default — only runs when a root is chosen and this box is checked.
                 </div>
             </div>
 
@@ -1207,10 +1242,10 @@
                 this.modules = {};
             }
 
-            restore(modules, instrument, confidenceMap) {
+            restore(modules, instrument, confidenceMap, keyRoot = null, keyScale = 'major') {
                 this.modules = modules;
                 let result = this.originalNotes.map(n => ({ ...n }));
-                this.stats = { removed: 0, merged: 0, repaired: 0, corrected: 0 };
+                this.stats = { removed: 0, merged: 0, repaired: 0, corrected: 0, keyCorrected: 0 };
 
                 // Apply modules in order (conservative first, then corrective)
                 if (modules.duplicate) result = this.removeDuplicates(result);
@@ -1221,6 +1256,7 @@
                 if (modules.voice) result = this.separateVoices(result);
                 if (modules.phrase) result = this.repairPhrases(result);
                 if (modules.pitch) result = this.repairPitchFlicker(result);
+                if (modules.key && keyRoot !== null && keyRoot !== '') result = this.correctToKey(result, parseInt(keyRoot, 10), keyScale);
                 if (modules.timing) result = this.repairTiming(result);
                 if (modules.velocity) result = this.smoothVelocity(result);
                 if (modules.chord) result = this.repairChords(result, confidenceMap);
@@ -1429,6 +1465,42 @@
                 }
                 
                 return result;
+            }
+
+            // Moves any note outside the chosen scale to the nearest in-scale pitch.
+            // Unlike the other modules this deliberately changes pitch content, so it
+            // only ever runs when explicitly enabled with a chosen root.
+            correctToKey(notes, keyRoot, scaleType) {
+                const scales = {
+                    major: [0, 2, 4, 5, 7, 9, 11],
+                    naturalMinor: [0, 2, 3, 5, 7, 8, 10],
+                    harmonicMinor: [0, 2, 3, 5, 7, 8, 11],
+                    melodicMinor: [0, 2, 3, 5, 7, 9, 11],
+                };
+                const scale = scales[scaleType] || scales.major;
+                const inScale = new Set(scale.map(iv => (iv + keyRoot) % 12));
+
+                return notes.map(n => {
+                    const pc = ((n.note % 12) + 12) % 12;
+                    if (inScale.has(pc)) return n;
+
+                    // Search outward for the nearest in-scale pitch class. On a tie
+                    // (equally close above and below), prefer moving up.
+                    let shift = 0;
+                    for (let d = 1; d <= 6; d++) {
+                        const up = (pc + d) % 12;
+                        const down = ((pc - d) % 12 + 12) % 12;
+                        if (inScale.has(up)) { shift = d;
+                            break; }
+                        if (inScale.has(down)) { shift = -d;
+                            break; }
+                    }
+
+                    const newNote = Math.min(127, Math.max(0, n.note + shift));
+                    this.stats.corrected++;
+                    this.stats.keyCorrected++;
+                    return { ...n, note: newNote, keyCorrected: true };
+                });
             }
 
             repairTiming(notes) {
@@ -1809,9 +1881,25 @@
             }
             
             state.detectedKey = bestKey;
+            const detectBtn = $('useDetectedKeyBtn');
+            detectBtn.textContent = `Use detected key: ${bestKey} major`;
+            detectBtn.style.display = 'block';
             
             // Simple beat detection
             detectBeats(audioData, sampleRate);
+        }
+
+        function useDetectedKey() {
+            if (!state.detectedKey) return;
+            const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+            const rootIndex = noteNames.indexOf(state.detectedKey);
+            if (rootIndex < 0) return;
+            $('keyRootSelect').value = String(rootIndex);
+            // The built-in detector only tests major keys (see analyzeAudio), so
+            // that's what this shortcut sets. Switch the scale manually if the
+            // piece is actually in the relative minor.
+            $('keyScaleSelect').value = 'major';
+            setStatus(`Key set to ${state.detectedKey} major`, '');
         }
 
         function detectBeats(audioData, sampleRate) {
@@ -2038,6 +2126,14 @@
             checkboxes.forEach(cb => { modules[cb.dataset.module] = cb.checked; });
 
             const instrument = $('instrumentSelect').value;
+            const keyRootValue = $('keyRootSelect').value;
+            const keyScaleValue = $('keyScaleSelect').value;
+
+            if (modules.key && keyRootValue === '') {
+                showModal('Key Not Selected', 'Please choose a key root before enabling "Snap notes to key", or uncheck that module to skip key correction.');
+                state.isProcessing = false;
+                return;
+            }
             
             // Build confidence map if audio available
             if (modules.audio && !state.confidenceMap.size && state.audioData) {
@@ -2046,7 +2142,7 @@
 
             // Run restoration
             const engine = new RestorationEngine(state.notes, state.ppq, state.tempoMap, state.originalMaxTime);
-            const cleaned = engine.restore(modules, instrument, state.confidenceMap);
+            const cleaned = engine.restore(modules, instrument, state.confidenceMap, keyRootValue, keyScaleValue);
 
             state.cleanedNotes = cleaned;
             state.isCleaned = true;
@@ -2070,7 +2166,8 @@
             renderPianoRoll();
 
             const stats = engine.getStats();
-            const summary = `Removed ${stats.removed}, merged ${stats.merged}, repaired ${stats.repaired}, corrected ${stats.corrected}`;
+            const summary = `Removed ${stats.removed}, merged ${stats.merged}, repaired ${stats.repaired}, corrected ${stats.corrected}` +
+                (stats.keyCorrected ? `, ${stats.keyCorrected} snapped to key` : '');
             setStatus(`✅ Restoration complete — ${summary}`, 'success');
 
             $('exportBtn').disabled = false;
@@ -2638,23 +2735,45 @@
                 const presets = {
                     conservative: { duplicate: true, ghost: true, overlap: true, hanging: true, merge: true,
                         timing: false, velocity: false, pitch: false, voice: false, phrase: false, chord: false,
-                        audio: true },
+                        audio: true, key: false },
                     standard: { duplicate: true, ghost: true, overlap: true, hanging: true, merge: true, timing: true,
-                        velocity: true, pitch: true, voice: true, phrase: true, chord: true, audio: true },
+                        velocity: true, pitch: true, voice: true, phrase: true, chord: true, audio: true, key: false },
                     aggressive: { duplicate: true, ghost: true, overlap: true, hanging: true, merge: true, timing: true,
-                        velocity: true, pitch: true, voice: true, phrase: true, chord: true, audio: true },
+                        velocity: true, pitch: true, voice: true, phrase: true, chord: true, audio: true, key: false },
                     piano: { duplicate: true, ghost: true, overlap: true, hanging: true, merge: true, timing: true,
-                        velocity: true, pitch: true, voice: true, phrase: true, chord: true, audio: true },
+                        velocity: true, pitch: true, voice: true, phrase: true, chord: true, audio: true, key: false },
                     guitar: { duplicate: true, ghost: true, overlap: true, hanging: true, merge: true, timing: true,
-                        velocity: true, pitch: true, voice: true, phrase: true, chord: false, audio: true },
+                        velocity: true, pitch: true, voice: true, phrase: true, chord: false, audio: true, key: false },
                     bass: { duplicate: true, ghost: true, overlap: true, hanging: true, merge: true, timing: true,
-                        velocity: true, pitch: true, voice: true, phrase: false, chord: false, audio: true },
+                        velocity: true, pitch: true, voice: true, phrase: false, chord: false, audio: true, key: false },
+                    // For MIDI that was sequenced/composed directly (not transcribed from audio).
+                    // Only fixes technical errors that are never intentional — exact duplicate
+                    // events, overlapping same-pitch notes, and notes with no note-off. Leaves
+                    // everything an arranger could have meant on purpose untouched: no timing
+                    // quantization, no velocity smoothing, no pitch/phrase/chord "correction",
+                    // no ghost-note removal (short/quiet notes may be deliberate), no merging of
+                    // repeated notes, and no audio-confidence filtering (there's no transcription
+                    // to check against — the MIDI itself is the source of truth).
+                    composed: { duplicate: true, ghost: false, overlap: true, hanging: true, merge: false,
+                        timing: false, velocity: false, pitch: false, voice: false, phrase: false, chord: false,
+                        audio: false, key: false },
+                };
+
+                const hints = {
+                    composed: 'Fixes only technical errors (duplicate events, overlapping notes, missing note-offs). No quantization, velocity, pitch, or audio-based changes — safe for MIDI that wasn\u2019t transcribed from audio.',
                 };
 
                 const preset = presets[this.dataset.preset] || presets.standard;
                 checkboxes.forEach(cb => {
                     cb.checked = preset[cb.dataset.module] !== undefined ? preset[cb.dataset.module] : true;
                 });
+                const hintEl = $('presetHint');
+                if (hints[this.dataset.preset]) {
+                    hintEl.textContent = hints[this.dataset.preset];
+                    hintEl.style.display = 'block';
+                } else {
+                    hintEl.style.display = 'none';
+                }
                 setStatus(`Preset: ${this.textContent} loaded`, '');
             });
         });
