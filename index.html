@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MIDI Restoration Studio v4.1 Fixed</title>
+    <title>MIDI Restoration Studio v4.4</title>
     <style>
         /* ===== CSS VARIABLES & RESET ===== */
         :root {
@@ -500,10 +500,11 @@
         <!-- ===== HEADER ===== -->
         <header class="header">
             <div class="header-left">
-                <div class="logo">🎵 MIDI Restoration <span>Studio <span class="version">v4.1 Fixed</span></span></div>
+                <div class="logo">🎵 MIDI Restoration <span>Studio <span class="version">v4.4</span></span></div>
                 <span class="validation-badge" id="validationBadge">✓ Validated</span>
             </div>
             <div class="header-actions">
+                <button class="btn-icon" onclick="resetApplication()">↻ Reset</button>
                 <button class="btn-icon" onclick="showHelp()">📖</button>
                 <button class="btn-icon" onclick="runValidation()">✓ Validate</button>
                 <button class="btn-icon" onclick="showAbout()">ℹ️</button>
@@ -537,6 +538,10 @@
                     <span class="value" id="tempoDisplay">—</span>
                     <span class="label">Format</span>
                     <span class="value" id="formatDisplay">—</span>
+                    <span class="label">MIDI Key</span>
+                    <span class="value" id="midiKeyDisplay">—</span>
+                    <span class="label">WAV Key</span>
+                    <span class="value" id="audioKeyDisplay">—</span>
                 </div>
             </div>
 
@@ -679,6 +684,7 @@
             <div class="panel-section">
                 <button class="action-btn primary" id="analyzeBtn" onclick="runAnalysis()" disabled>🔬 Analyze</button>
                 <button class="action-btn success" id="restoreBtn" onclick="runRestoration()" disabled>🧹 Restore</button>
+                <button class="action-btn primary" id="previewBtn" onclick="previewRestored()" disabled>▶ Preview Restored MIDI</button>
                 <button class="action-btn warning" id="exportBtn" onclick="exportMIDI()" disabled>💾 Export MIDI</button>
             </div>
         </aside>
@@ -719,7 +725,7 @@
     <!-- ============================================================ -->
     <script>
         // ============================================================
-        // MIDI Restoration Studio v4.1 Fixed - Reliable Restoration Build
+        // MIDI Restoration Studio v4.4 - Reliable Restoration Build
         // Core Design: Restoration, not composition
         // ============================================================
 
@@ -755,7 +761,9 @@
             beats: [],
             onsets: [],
             detectedTempo: 120,
-            detectedKey: 'C',
+            detectedKey: null,
+            midiDetectedKey: null,
+            audioDetectedKey: null,
             chords: [],
             voices: [],
             phrases: [],
@@ -1682,6 +1690,8 @@
                     updateFileInfo(file);
                     $('analyzeBtn').disabled = false;
                     $('restoreBtn').disabled = false;
+                    $('previewBtn').disabled = true;
+                    $('exportBtn').disabled = true;
                     
                     setStatus(`✅ MIDI loaded: ${file.name} (${result.notes.length} notes)`, 'success');
                     renderPianoRoll();
@@ -1796,6 +1806,39 @@
             return seconds;
         }
 
+        function detectKeyFromPitchClass(values) {
+            if (!values || values.length < 12) return null;
+            const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+            const majorProfile = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
+            const minorProfile = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
+            const corr = (a, b) => {
+                const am = a.reduce((x,y)=>x+y,0)/a.length;
+                const bm = b.reduce((x,y)=>x+y,0)/b.length;
+                let num=0, da=0, db=0;
+                for (let i=0;i<a.length;i++) { const x=a[i]-am, y=b[i]-bm; num+=x*y; da+=x*x; db+=y*y; }
+                return num / (Math.sqrt(da*db) || 1);
+            };
+            let best = null;
+            for (let root=0; root<12; root++) {
+                for (const [mode, profile] of [['major', majorProfile], ['minor', minorProfile]]) {
+                    const rotated = values.map((_, i) => profile[(i-root+12)%12]);
+                    const score = corr(values, rotated);
+                    if (!best || score > best.score) best = { root, rootName: noteNames[root], mode, score };
+                }
+            }
+            return best;
+        }
+
+        function detectMIDIKey(notes) {
+            if (!notes || !notes.length) return null;
+            const pc = new Array(12).fill(0);
+            for (const n of notes) {
+                const duration = Math.max(1, (n.end ?? n.start + 1) - n.start);
+                pc[((n.note % 12)+12)%12] += duration * Math.max(1, n.velocity || 64);
+            }
+            return detectKeyFromPitchClass(pc);
+        }
+
         async function analyzeAudio(audioData, sampleRate) {
             const fftSize = 2048;
             const chroma = new Array(12).fill(0);
@@ -1861,45 +1904,28 @@
             state.spectrogram = spectrogram;
             state.frameTimes = frameTimes;
             
-            // Simple key detection
-            const keys = ['C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#', 'G#', 'D#', 'A#', 'F'];
-            const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-            let maxScore = 0;
-            let bestKey = 'C';
-            
-            for (const key of keys) {
-                const root = noteNames.indexOf(key);
-                if (root < 0) continue;
-                let score = 0;
-                for (let i = 0; i < 12; i++) {
-                    const idx = (root + i) % 12;
-                    const weight = [1, 0.5, 1, 0.5, 1, 1, 0.5, 1, 0.5, 1, 0.5, 1][i];
-                    score += chroma[idx] * weight;
-                }
-                if (score > maxScore) { maxScore = score;
-                    bestKey = key; }
-            }
-            
-            state.detectedKey = bestKey;
+            // Detect both major and minor keys with Krumhansl-Schmuckler profiles.
+            const audioKey = detectKeyFromPitchClass(chroma);
+            state.audioDetectedKey = audioKey;
+            state.detectedKey = audioKey;
+            $('audioKeyDisplay').textContent = audioKey ? `${audioKey.rootName} ${audioKey.mode}` : '—';
             const detectBtn = $('useDetectedKeyBtn');
-            detectBtn.textContent = `Use detected key: ${bestKey} major`;
-            detectBtn.style.display = 'block';
+            if (audioKey) {
+                detectBtn.textContent = `Use WAV key: ${audioKey.rootName} ${audioKey.mode}`;
+                detectBtn.style.display = 'block';
+            }
             
             // Simple beat detection
             detectBeats(audioData, sampleRate);
         }
 
         function useDetectedKey() {
-            if (!state.detectedKey) return;
-            const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-            const rootIndex = noteNames.indexOf(state.detectedKey);
-            if (rootIndex < 0) return;
-            $('keyRootSelect').value = String(rootIndex);
-            // The built-in detector only tests major keys (see analyzeAudio), so
-            // that's what this shortcut sets. Switch the scale manually if the
-            // piece is actually in the relative minor.
-            $('keyScaleSelect').value = 'major';
-            setStatus(`Key set to ${state.detectedKey} major`, '');
+            const detected = state.audioDetectedKey || state.midiDetectedKey || state.detectedKey;
+            if (!detected) return;
+            $('keyRootSelect').value = String(detected.root);
+            $('keyScaleSelect').value = detected.mode === 'minor' ? 'naturalMinor' : 'major';
+            $('keyModuleCheckbox').checked = true;
+            setStatus(`Key snap enabled: ${detected.rootName} ${detected.mode}`, '');
         }
 
         function detectBeats(audioData, sampleRate) {
@@ -2035,6 +2061,16 @@
             }
 
             setStatus('🔬 Analysing...', 'highlight');
+
+            state.midiDetectedKey = detectMIDIKey(state.notes);
+            $('midiKeyDisplay').textContent = state.midiDetectedKey
+                ? `${state.midiDetectedKey.rootName} ${state.midiDetectedKey.mode}` : '—';
+            if (!state.audioDetectedKey && state.midiDetectedKey) {
+                state.detectedKey = state.midiDetectedKey;
+                const detectBtn = $('useDetectedKeyBtn');
+                detectBtn.textContent = `Use MIDI key: ${state.midiDetectedKey.rootName} ${state.midiDetectedKey.mode}`;
+                detectBtn.style.display = 'block';
+            }
             
             // Build confidence if audio available
             if (state.audioData) {
@@ -2124,6 +2160,7 @@
             const checkboxes = document.querySelectorAll('#moduleGrid input[type="checkbox"]');
             const modules = {};
             checkboxes.forEach(cb => { modules[cb.dataset.module] = cb.checked; });
+            modules.key = $('keyModuleCheckbox').checked;
 
             const instrument = $('instrumentSelect').value;
             const keyRootValue = $('keyRootSelect').value;
@@ -2146,6 +2183,7 @@
 
             state.cleanedNotes = cleaned;
             state.isCleaned = true;
+            const restorationStats = engine.getStats();
 
             // Update confidence
             if (state.confidenceMap.size > 0) {
@@ -2170,6 +2208,7 @@
                 (stats.keyCorrected ? `, ${stats.keyCorrected} snapped to key` : '');
             setStatus(`✅ Restoration complete — ${summary}`, 'success');
 
+            $('previewBtn').disabled = false;
             $('exportBtn').disabled = false;
             
             state.isProcessing = false;
@@ -2555,6 +2594,17 @@
             setStatus(`Audition: ${mode} mode`, '');
         }
 
+
+        function previewRestored() {
+            if (!state.isCleaned || !state.cleanedNotes || state.cleanedNotes.length === 0) {
+                showModal('Nothing to Preview', 'Run Restore first, then preview the restored MIDI.');
+                return;
+            }
+            stopAudition();
+            setAuditionMode('after');
+            playAudition();
+        }
+
         function playAudition() {
             const notes = state.auditionMode === 'after' && state.isCleaned ?
                 state.cleanedNotes :
@@ -2636,6 +2686,36 @@
             state.zoomLevel = Math.max(0.1, Math.min(5, state.zoomLevel + dir * 0.1));
             $('zoomDisplay').textContent = `${Math.round(state.zoomLevel * 100)}%`;
             renderPianoRoll();
+        }
+
+        function resetApplication() {
+            stopAudition();
+            if (state.audioContext && state.audioContext.state !== 'closed') {
+                state.audioContext.close().catch(() => {});
+            }
+            const fresh = {
+                midiFileName:null,audioFileName:null,midiData:null,notes:[],originalNotes:[],cleanedNotes:[],tracks:[],
+                tempoMap:[{time:0,tempo:500000}],timeSignatures:[],keySignatures:[],ppq:480,format:1,duration:0,originalMaxTime:0,
+                audioData:null,audioBuffer:null,audioContext:null,sampleRate:44100,confidenceMap:new Map(),confidenceExplanations:new Map(),
+                chromagram:[],spectrogram:[],frameTimes:[],beats:[],onsets:[],detectedTempo:120,detectedKey:null,midiDetectedKey:null,audioDetectedKey:null,
+                chords:[],voices:[],phrases:[],stats:null,isCleaned:false,confidenceScore:0,zoomLevel:1,showConfidence:true,
+                showWaveformOverlay:false,showChordOverlay:false,auditionMode:'before',instrument:'piano',activePreset:'conservative',
+                noteIdCounter:0,validationPassed:false,validationErrors:[],isProcessing:false
+            };
+            Object.assign(state, fresh);
+            $('midiInput').value=''; $('audioInput').value='';
+            for (const id of ['midiFileName','audioFileName']) { $(id).textContent=''; $(id).style.display='none'; }
+            for (const id of ['trackCount','noteCount','tempoDisplay','formatDisplay','midiKeyDisplay','audioKeyDisplay']) $(id).textContent='—';
+            $('fileStatus').className='file-status missing'; $('fileStatus').textContent='No files loaded';
+            $('audioStatus').innerHTML='<div>⏳ Waiting for audio...</div>';
+            $('statsPlaceholder').style.display='block'; $('statsContent').style.display='none'; $('statGrid').innerHTML='';
+            $('analyzeBtn').disabled=true; $('restoreBtn').disabled=true; $('previewBtn').disabled=true; $('exportBtn').disabled=true;
+            $('keyRootSelect').value=''; $('keyScaleSelect').value='major'; $('keyModuleCheckbox').checked=false;
+            $('useDetectedKeyBtn').style.display='none';
+            $('confidenceRing').textContent='0%'; $('confidenceRing').className='ring low'; $('confidenceScore').textContent='—'; $('confidenceLabel').textContent='No data';
+            $('validationBadge').className='validation-badge';
+            renderPianoRoll(); drawWaveform(new Float32Array(0));
+            setStatus('Ready — Load MIDI and WAV files', '');
         }
 
         function resetView() {
@@ -2767,6 +2847,7 @@
                 checkboxes.forEach(cb => {
                     cb.checked = preset[cb.dataset.module] !== undefined ? preset[cb.dataset.module] : true;
                 });
+                $('keyModuleCheckbox').checked = !!preset.key;
                 const hintEl = $('presetHint');
                 if (hints[this.dataset.preset]) {
                     hintEl.textContent = hints[this.dataset.preset];
@@ -2829,8 +2910,8 @@
         function init() {
             initFileHandling();
             renderPianoRoll();
-            setStatus('🎵 MIDI Restoration Studio v4.0 — Load MIDI and WAV files', '');
-            console.log('🎵 MIDI Restoration Studio v4.0');
+            setStatus('🎵 MIDI Restoration Studio v4.4 — Load MIDI and WAV files', '');
+            console.log('🎵 MIDI Restoration Studio v4.4');
             console.log('Core Principles: Restoration, not composition');
             console.log('✅ Standards-compliant MIDI parser/writer');
             console.log('✅ 12 restoration modules');
